@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>订阅下载与SS转 sing-box 配置</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, PingFang SC, Microsoft YaHei, sans-serif; margin: 24px; line-height: 1.6; background: Canvas; color: CanvasText; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  .card { border: 1px solid #8884; border-radius: 10px; padding: 16px; margin-bottom: 16px; background: Canvas; }
+  label { font-weight: 600; }
+  input, textarea, select, button { width: 100%; box-sizing: border-box; padding: 10px; margin-top: 6px; margin-bottom: 12px; border-radius: 8px; border: 1px solid GrayText; background: Field; color: FieldText; }
+  textarea { min-height: 160px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  select option { background: Field; color: FieldText; }
+  .row { display: grid; grid-template-columns: 1fr; gap: 12px; }
+  @media (min-width: 860px) { .row { grid-template-columns: 2fr 1fr; } }
+  .actions { display: grid; grid-template-columns: repeat(2, minmax(120px, 1fr)); gap: 10px; }
+  .hint { font-size: 12px; color: GrayText; margin-top: -6px; }
+  .ok { color: #2aa52a; }
+  .warn { color: #c77a00; }
+  .err { color: #cc2b2b; }
+  .muted { color: GrayText; font-size: 12px; }
+  .small { font-size: 12px; }
+  .list { max-height: 220px; overflow: auto; border: 1px dashed #8884; border-radius: 8px; padding: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: Field; color: FieldText; }
+  textarea.list { max-height: none; min-height: 320px; }
+</style>
+</head>
+<body>
+  <h1>订阅下载 + Base64 解码 + SS 转 sing-box 配置</h1>
+
+  <div class="card">
+    <label for="subUrl">订阅链接（返回 Base64 编码的多行 ss 链接）</label>
+    <input id="subUrl" type="url" placeholder="例如：https://example.com/sub.txt" list="subHistory" />
+    <datalist id="subHistory"></datalist>
+    <div class="actions">
+      <button id="btnFetch">下载并解码</button>
+      <button id="btnParse">直接解析下方文本</button>
+    </div>
+    <button id="btnClearHistory" class="small" style="width:auto">清空订阅历史</button>
+    <label for="rawArea">原始内容（Base64 或已解码的多行 ss://...）</label>
+    <textarea id="rawArea" placeholder="可在此粘贴订阅返回的 Base64 内容；或直接粘贴多行 ss://... 链接"></textarea>
+    <div id="status" class="muted">就绪</div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h2 class="small">识别到的节点（ss/vmess）</h2>
+      <textarea id="nodeList" class="list small" placeholder="一行一个 ss:// 或 vmess:// 链接，可手动增删改"></textarea>
+      <div class="actions" style="grid-template-columns: 1fr;">
+        <button id="btnParseList">手动解析当前列表</button>
+      </div>
+    </div>
+    <div class="card">
+      <label for="defaultNode">默认节点</label>
+      <select id="defaultNode"><option value="">（解析后填充）</option></select>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2 class="small">生成的 sing-box 配置</h2>
+    <textarea id="configArea" readonly placeholder="点击上方按钮生成配置"></textarea>
+    <div class="actions">
+      <button id="btnCopy">复制配置</button>
+      <button id="btnDownload">下载 config.json</button>
+    </div>
+    <div class="hint">说明：本工具仅转换 Shadowsocks（ss）节点；插件参数暂不处理。当前导出仅包含你所选择的单个节点。</div>
+  </div>
+
+  <div class="card">
+    <h2 class="small">获取与运行 sing-box</h2>
+    <p class="small">项目地址：<a href="https://github.com/SagerNet/sing-box" target="_blank" rel="noopener noreferrer">SagerNet/sing-box（GitHub）</a></p>
+  </div>
+
+<script>
+(function() {
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $("status");
+  const rawArea = $("rawArea");
+  const nodeList = $("nodeList");
+  const configArea = $("configArea");
+  const defaultNodeSel = $("defaultNode");
+  const subHistoryList = $("subHistory");
+
+  function setStatus(msg, type = "") {
+    statusEl.textContent = msg;
+    statusEl.className = type ? type : "muted";
+  }
+
+  // Base64 标准与 URL 安全解码，自动补齐 padding
+  function b64decodeAuto(input) {
+    try {
+      let s = input.trim();
+      // URL-safe -> standard
+      s = s.replace(/-/g, '+').replace(/_/g, '/');
+      // 去掉换行与空白
+      s = s.replace(/\s+/g, '');
+      // padding
+      const pad = s.length % 4;
+      if (pad === 2) s += '==';
+      else if (pad === 3) s += '=';
+      else if (pad !== 0 && pad !== 2 && pad !== 3) {
+        // 尝试容错：强制补齐到4倍数
+        s = s.padEnd(s.length + (4 - pad), '=');
+      }
+      return decodeURIComponent(escape(window.atob(s)));
+    } catch (e) {
+      throw new Error("Base64 解码失败：" + e.message);
+    }
+  }
+
+  // 解析多行 ss/vmess 链接
+  function parseMixedLines(linesText) {
+    const lines = linesText.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const nodes = [];
+
+    for (const line of lines) {
+      const lower = line.toLowerCase();
+      if (lower.startsWith('ss://')) {
+        try {
+          const payload = line.slice(5);
+          let mainPart = payload;
+          let tag = '';
+          const hashIdx = payload.indexOf('#');
+          if (hashIdx >= 0) {
+            tag = decodeURIComponent(payload.slice(hashIdx + 1));
+            mainPart = payload.slice(0, hashIdx);
+          }
+          let userInfoHostPort = '';
+          if (mainPart.includes('@')) {
+            const qIdx = mainPart.indexOf('?');
+            userInfoHostPort = qIdx >= 0 ? mainPart.slice(0, qIdx) : mainPart;
+          } else {
+            userInfoHostPort = b64decodeAuto(mainPart);
+          }
+          const atIdx = userInfoHostPort.lastIndexOf('@');
+          if (atIdx <= 0) throw new Error('无效的 ss 链接：缺少 @');
+          const methodPass = userInfoHostPort.slice(0, atIdx);
+          const hostPort = userInfoHostPort.slice(atIdx + 1);
+          let method = '';
+          let password = '';
+          if (methodPass.includes(':')) {
+            const [m, ...rest] = methodPass.split(':');
+            method = m; password = rest.join(':');
+          } else {
+            const decoded = b64decodeAuto(methodPass);
+            const [m, ...rest] = decoded.split(':');
+            method = m; password = rest.join(':');
+          }
+          const hp = hostPort.split('@').pop();
+          const [host, portStr] = hp.split(':');
+          const port = Number(portStr);
+          if (!host || !Number.isFinite(port)) throw new Error('主机或端口无效');
+          nodes.push({ scheme: 'ss', type: 'shadowsocks', tag: tag || `${host}:${port}`, server: host, server_port: port, method, password });
+        } catch (e) { console.warn('解析失败 ss', line, e); }
+        continue;
+      }
+      if (lower.startsWith('vmess://')) {
+        try {
+          const b64 = line.slice(8);
+          const json = JSON.parse(b64decodeAuto(b64));
+          const tag = json.ps || `${json.add}:${json.port}`;
+          const node = {
+            scheme: 'vmess',
+            type: 'vmess',
+            tag,
+            server: json.add,
+            server_port: Number(json.port),
+            uuid: json.id,
+            security: json.scy || 'auto',
+            alter_id: json.aid ? Number(json.aid) : 0,
+            network: json.net || 'tcp',
+            host: json.host || '',
+            path: json.path || '',
+            tls: (json.tls || '').toLowerCase() === 'tls',
+            sni: json.sni || '',
+            alpn: json.alpn ? (Array.isArray(json.alpn) ? json.alpn : [json.alpn]) : undefined
+          };
+          nodes.push(node);
+        } catch (e) { console.warn('解析失败 vmess', line, e); }
+        continue;
+      }
+    }
+    return nodes;
+  }
+
+  function genSingBoxConfigFromSingleNode(node) {
+    const outbounds = [];
+    if (node.type === 'shadowsocks') {
+      outbounds.push({
+        type: 'shadowsocks',
+        tag: node.tag,
+        server: node.server,
+        server_port: node.server_port,
+        method: node.method,
+        password: node.password
+      });
+    } else if (node.type === 'vmess') {
+      const outbound = {
+        type: 'vmess',
+        tag: node.tag,
+        server: node.server,
+        server_port: node.server_port,
+        uuid: node.uuid,
+        security: node.security || 'auto',
+        alter_id: node.alter_id || 0
+      };
+      if (node.network && node.network.toLowerCase() === 'ws') {
+        outbound.transport = {
+          type: 'ws',
+          path: node.path || '/',
+          headers: node.host ? { Host: node.host } : undefined
+        };
+      }
+      if (node.tls) {
+        outbound.tls = {
+          enabled: true,
+          server_name: node.sni || node.host || undefined,
+          alpn: node.alpn
+        };
+      }
+      outbounds.push(outbound);
+    }
+    outbounds.push({ type: 'direct', tag: 'direct' });
+    outbounds.push({ type: 'block', tag: 'block' });
+
+    const conf = {
+      log: { level: 'info' },
+      inbounds: [
+        { type: 'mixed', tag: 'mixed-in', listen: '127.0.0.1', listen_port: 7890 }
+      ],
+      outbounds
+    };
+    return conf;
+  }
+
+  function toSSLink(node) {
+    const userinfo = `${node.method}:${node.password}@${node.server}:${node.server_port}`;
+    const b64 = window.btoa(unescape(encodeURIComponent(userinfo)));
+    const tag = node.tag ? `#${encodeURIComponent(node.tag)}` : '';
+    return `ss://${b64}${tag}`;
+  }
+  function toVmessLink(node) {
+    const data = {
+      v: '2',
+      ps: node.tag,
+      add: node.server,
+      port: String(node.server_port),
+      id: node.uuid,
+      aid: String(node.alter_id || 0),
+      scy: node.security || 'auto',
+      net: node.network || 'tcp',
+      type: 'none',
+      host: node.host || '',
+      path: node.path || '',
+      tls: node.tls ? 'tls' : '',
+      sni: node.sni || ''
+    };
+    const json = JSON.stringify(data);
+    const b64 = window.btoa(unescape(encodeURIComponent(json)));
+    return `vmess://${b64}`;
+  }
+  function toLink(node) {
+    if (node.scheme === 'vmess' || node.type === 'vmess') return toVmessLink(node);
+    return toSSLink(node);
+  }
+
+  function renderNodes(nodes) {
+    if (!nodes.length) { nodeList.value = ''; nodeList.placeholder = '暂无'; return; }
+    const links = nodes.map(n => toLink(n)).join('\n');
+    nodeList.value = links;
+  }
+
+  async function fetchSubscription(url) {
+    const res = await fetch(url, { credentials: 'omit', cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const buf = await res.arrayBuffer();
+    // 猜测为文本
+    const text = new TextDecoder('utf-8').decode(buf);
+    return text;
+  }
+
+  function tryDecodeToLines(text) {
+    // 如果看起来像多行 ss 直接返回
+    if (/^\s*(ss|vmess):\/\//im.test(text)) return splitConcatenatedLinks(text);
+    // 否则当作 base64 解码
+    const decoded = b64decodeAuto(text);
+    return splitConcatenatedLinks(decoded);
+  }
+
+  // 将可能连在一起的 ss:// 与 vmess:// 按前缀拆分为多行
+  function splitConcatenatedLinks(text) {
+    const s = String(text || '');
+    // 快速判断：若已有换行且每行都规范，可直接返回
+    if (/\n/.test(s)) return s;
+    const prefixes = /(ss|vmess):\/\//gi;
+    const indices = [];
+    let m;
+    while ((m = prefixes.exec(s)) !== null) {
+      indices.push(m.index);
+    }
+    if (indices.length <= 1) return s.trim();
+    const parts = [];
+    for (let i = 0; i < indices.length; i++) {
+      const start = indices[i];
+      const end = i + 1 < indices.length ? indices[i + 1] : s.length;
+      const seg = s.slice(start, end).trim();
+      if (seg) parts.push(seg);
+    }
+    return parts.join('\n');
+  }
+
+  function parseLinksFromTextarea() {
+    const text = splitConcatenatedLinks(nodeList.value || '');
+    const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const nodes = [];
+    for (const line of lines) {
+      const lower = line.toLowerCase();
+      if (lower.startsWith('ss://')) {
+        try {
+          const noPrefix = line.slice(5);
+          const [main, hash] = noPrefix.split('#');
+          const tag = hash ? decodeURIComponent(hash) : '';
+          let userinfo;
+          if (main.includes('@') && main.includes(':') && !/[A-Za-z0-9+/=_-]{8,}/.test(main)) {
+            userinfo = main;
+          } else {
+            userinfo = b64decodeAuto(main);
+          }
+          const at = userinfo.lastIndexOf('@');
+          if (at <= 0) throw new Error('缺少@');
+          const mp = userinfo.slice(0, at);
+          const hp = userinfo.slice(at + 1);
+          const [method, ...restPass] = mp.split(':');
+          const password = restPass.join(':');
+          const [host, portStr] = hp.split(':');
+          const port = Number(portStr);
+          if (!method || !password || !host || !Number.isFinite(port)) throw new Error('字段无效');
+          nodes.push({ scheme: 'ss', type: 'shadowsocks', tag: tag || `${host}:${port}`, server: host, server_port: port, method, password });
+        } catch (e) { }
+      } else if (lower.startsWith('vmess://')) {
+        try {
+          const b64 = line.slice(8);
+          const json = JSON.parse(b64decodeAuto(b64));
+          nodes.push({
+            scheme: 'vmess', type: 'vmess', tag: json.ps || `${json.add}:${json.port}`,
+            server: json.add, server_port: Number(json.port), uuid: json.id,
+            security: json.scy || 'auto', alter_id: json.aid ? Number(json.aid) : 0,
+            network: json.net || 'tcp', host: json.host || '', path: json.path || '',
+            tls: (json.tls || '').toLowerCase() === 'tls', sni: json.sni || '', alpn: json.alpn
+          });
+        } catch (e) { }
+      }
+    }
+    return nodes;
+  }
+
+  function rebuildFromEditableList() {
+    const nodes = parseLinksFromTextarea();
+    // 重建默认节点下拉，保留已有选择
+    const prevSelected = defaultNodeSel.value;
+    defaultNodeSel.innerHTML = '';
+    if (nodes.length) {
+      for (const n of nodes) {
+        const opt = document.createElement('option');
+        opt.value = n.tag; opt.textContent = n.tag;
+        defaultNodeSel.appendChild(opt);
+      }
+      // 恢复之前的选择
+      if (prevSelected && nodes.some(n => n.tag === prevSelected)) {
+        defaultNodeSel.value = prevSelected;
+      }
+      if (defaultNodeSel.selectedIndex < 0) defaultNodeSel.selectedIndex = 0;
+    } else {
+      const opt = document.createElement('option');
+      opt.value = ''; opt.textContent = '（解析后填充）';
+      defaultNodeSel.appendChild(opt);
+    }
+
+    if (!nodes.length) {
+      configArea.value = '';
+      setStatus('当前列表为空或无效', 'warn');
+      return;
+    }
+    const selectedTag = defaultNodeSel.value || nodes[0].tag;
+    const node = nodes.find(n => n.tag === selectedTag) || nodes[0];
+    const conf = genSingBoxConfigFromSingleNode(node);
+    configArea.value = JSON.stringify(conf, null, 2);
+    setStatus(`节点列表已更新，当前选择：${node.tag}`, 'ok');
+  }
+
+  function onParse() {
+    try {
+      const decoded = tryDecodeToLines(rawArea.value);
+      const nodes = parseMixedLines(decoded);
+      // 首先把 nodes 渲染为可编辑 链接文本
+      nodeList.value = nodes.map(n => toLink(n)).join('\n');
+      // 再联动重建
+      rebuildFromEditableList();
+    } catch (e) {
+      setStatus(e.message || String(e), 'err');
+    }
+  }
+
+  function loadSubHistory() {
+    try {
+      const raw = localStorage.getItem('sub_history');
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return [];
+      return arr.filter(x => typeof x === 'string');
+    } catch {
+      return [];
+    }
+  }
+  function saveSubHistory(list) {
+    try { localStorage.setItem('sub_history', JSON.stringify(list.slice(0, 50))); } catch {}
+  }
+  function addToSubHistory(url) {
+    const list = loadSubHistory();
+    const u = url.trim();
+    if (!u) return;
+    const existsIdx = list.findIndex(x => x === u);
+    if (existsIdx >= 0) list.splice(existsIdx, 1);
+    list.unshift(u);
+    saveSubHistory(list);
+    renderSubHistory();
+  }
+  function renderSubHistory() {
+    const list = loadSubHistory();
+    subHistoryList.innerHTML = '';
+    for (const u of list) {
+      const opt = document.createElement('option');
+      opt.value = u;
+      subHistoryList.appendChild(opt);
+    }
+  }
+
+  async function onFetch() {
+    const url = $("subUrl").value.trim();
+    if (!url) { setStatus('请输入订阅链接', 'warn'); return; }
+    setStatus('下载中...');
+    try {
+      const text = await fetchSubscription(url);
+      rawArea.value = text;
+      addToSubHistory(url);
+      setStatus('订阅已下载，尝试解码与解析...', 'ok');
+      onParse();
+    } catch (e) {
+      const safeUrl = url;
+      statusEl.className = 'err';
+      statusEl.innerHTML = '下载失败，可能是跨域（CORS）限制：' + (e.message || e) + (safeUrl ? ' · ' + `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">打开订阅</a>` : '');
+    }
+  }
+
+  async function onCopy() {
+    const txt = configArea.value.trim();
+    if (!txt) { setStatus('没有可复制的配置', 'warn'); return; }
+    try {
+      await navigator.clipboard.writeText(txt);
+      setStatus('已复制到剪贴板', 'ok');
+    } catch (e) {
+      // 回退
+      const ta = document.createElement('textarea');
+      ta.value = txt; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); setStatus('已复制到剪贴板', 'ok'); } catch(_) { setStatus('复制失败', 'err'); }
+      document.body.removeChild(ta);
+    }
+  }
+
+  function onDownload() {
+    const txt = configArea.value.trim();
+    if (!txt) { setStatus('没有可下载的配置', 'warn'); return; }
+    const blob = new Blob([txt], { type: 'application/json;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'config.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    setStatus('config.json 已下载', 'ok');
+  }
+
+  $("btnFetch").addEventListener('click', onFetch);
+  $("btnParse").addEventListener('click', onParse);
+  $("btnCopy").addEventListener('click', onCopy);
+  $("btnDownload").addEventListener('click', onDownload);
+  $("btnClearHistory").addEventListener('click', () => { saveSubHistory([]); renderSubHistory(); setStatus('已清空订阅历史', 'ok'); });
+  renderSubHistory();
+  $("defaultNode").addEventListener('change', () => {
+    try {
+      // 基于可编辑列表重建配置
+      rebuildFromEditableList();
+    } catch (e) {
+      setStatus(e.message || String(e), 'err');
+    }
+  });
+  nodeList.addEventListener('input', () => {
+    rebuildFromEditableList();
+  });
+  $("btnParseList").addEventListener('click', () => {
+    rebuildFromEditableList();
+  });
+})();
+</script>
+</body>
+</html>
