@@ -319,18 +319,23 @@
       if (lower.startsWith('ss://')) {
         try {
           const noPrefix = line.slice(5);
-          const [main, hash] = noPrefix.split('#');
+          const [mainWithQuery, hash] = noPrefix.split('#');
           const tag = hash ? decodeURIComponent(hash) : '';
-          let userinfo;
-          if (main.includes('@') && main.includes(':') && !/[A-Za-z0-9+/=_-]{8,}/.test(main)) {
-            userinfo = main;
-          } else {
-            userinfo = b64decodeAuto(main);
-          }
+          // 剥离查询串（如 plugin 参数）
+          const qIdx = mainWithQuery.indexOf('?');
+          const main = qIdx >= 0 ? mainWithQuery.slice(0, qIdx) : mainWithQuery;
+          // 兼容两种形态：
+          // 1) ss://base64(method:password)@host:port
+          // 2) ss://method:password@host:port
+          let userinfo = main;
           const at = userinfo.lastIndexOf('@');
           if (at <= 0) throw new Error('缺少@');
-          const mp = userinfo.slice(0, at);
+          let mp = userinfo.slice(0, at);
           const hp = userinfo.slice(at + 1);
+          // 若 mp 非 method:password 明文，则尝试 base64 解码 mp
+          if (!mp.includes(':')) {
+            mp = b64decodeAuto(mp);
+          }
           const [method, ...restPass] = mp.split(':');
           const password = restPass.join(':');
           const [host, portStr] = hp.split(':');
